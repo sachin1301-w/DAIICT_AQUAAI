@@ -18,8 +18,7 @@ python-dotenv>=1.0
 
 # GNN-based entity risk scoring (backend/gnn_service.py) -- CPU builds,
 # optional at runtime (graceful degradation if missing or unmodeled).
-torch>=2.5
-torch_geometric>=2.5
+
 
 # dev / tests
 pytest>=8.0
