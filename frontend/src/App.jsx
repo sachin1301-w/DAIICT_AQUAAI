@@ -8,6 +8,7 @@ import GenerateTransaction from "./components/GenerateTransaction.jsx";
 import QRVerification from "./components/QRVerification.jsx";
 import RecVerification from "./components/RecVerification.jsx";
 import VerificationHistory from "./components/VerificationHistory.jsx";
+import GraphFraudDetection from "./components/GraphFraudDetection.jsx";
 import { api, connectLiveFeed } from "./api.js";
 
 const NAV = [
@@ -16,6 +17,7 @@ const NAV = [
   { id: "alerts", label: "Fraud Alerts" },
   { id: "clusters", label: "Fraud Clusters" },
   { id: "graph", label: "Network Graph" },
+  { id: "graphfraud", label: "Graph Fraud Detection" },
   { id: "simulation", label: "Simulation Control" },
   { id: "recverify", label: "Verify REC" },
   { id: "verhistory", label: "Verification History" },
@@ -45,6 +47,12 @@ export default function App() {
   // Summary card and the Verification History page refresh immediately --
   // separate from resetEpoch since a verification never clears anything.
   const [verificationEpoch, setVerificationEpoch] = useState(0);
+  // Bumped on "graph_reset" broadcasts (from the dedicated Reset Graph
+  // button, separate from a full Reset Transactions) so the Graph Fraud
+  // Detection page's network view clears immediately too.
+  const [graphEpoch, setGraphEpoch] = useState(0);
+  const [deepLinkRecId, setDeepLinkRecId] = useState("");
+  const [recVerifyNonce, setRecVerifyNonce] = useState(0);
   const [toasts, setToasts] = useState([]);
 
   function pushToast(toast) {
@@ -56,6 +64,12 @@ export default function App() {
   function openClusterGraph(entityIds) {
     setGraphFocus(entityIds);
     setView("graph");
+  }
+
+  function openRecVerify(recId) {
+    setDeepLinkRecId(recId);
+    setRecVerifyNonce((n) => n + 1);
+    setView("recverify");
   }
 
   useEffect(() => {
@@ -78,6 +92,14 @@ export default function App() {
         pushToast({ tone: "danger", text: `TAMPER DETECTED on ${msg.rec_id}: ${msg.reason}` });
       } else if (msg.type === "tamper_simulated") {
         pushToast({ tone: "warn", text: `[demo] Simulated tampering on ${msg.rec_id} -- run Verify REC to catch it` });
+      } else if (msg.type === "graph_reset") {
+        setGraphEpoch((e) => e + 1);
+      } else if (msg.type === "fraud_ring_detected") {
+        pushToast({ tone: "danger", text: "New circular trading loop (fraud ring) detected in the graph" });
+      } else if (msg.type === "community_detected") {
+        pushToast({ tone: "warn", text: "New suspicious community detected in the graph" });
+      } else if (msg.type === "motif_detected") {
+        pushToast({ tone: "warn", text: "New suspicious pattern (motif) detected in the graph" });
       }
     });
     return disconnect;
@@ -135,8 +157,13 @@ export default function App() {
         {view === "graph" && (
           <NetworkGraph focusEntities={graphFocus} onClearFocus={() => setGraphFocus(null)} resetEpoch={resetEpoch} />
         )}
+        {view === "graphfraud" && (
+          <GraphFraudDetection resetEpoch={resetEpoch + graphEpoch} onOpenRecVerify={openRecVerify} />
+        )}
         {view === "simulation" && <GenerateTransaction resetEpoch={resetEpoch} />}
-        {view === "recverify" && <RecVerification resetEpoch={resetEpoch} />}
+        {view === "recverify" && (
+          <RecVerification key={`recverify-${recVerifyNonce}`} resetEpoch={resetEpoch} initialRecId={deepLinkRecId} />
+        )}
         {view === "verhistory" && <VerificationHistory resetEpoch={verificationEpoch} />}
         {view === "verify" && <QRVerification initialRecId={initialRecIdFromUrl()} />}
       </main>

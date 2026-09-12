@@ -1,0 +1,42 @@
+{
+  "feature_order": [
+    "degree",
+    "in_degree",
+    "out_degree",
+    "total_volume",
+    "transaction_count",
+    "avg_quantity",
+    "clustering_coefficient",
+    "avg_time_gap_seconds"
+  ],
+  "mean": [
+    2.2363946437835693,
+    1.1181973218917847,
+    1.1181973218917847,
+    76.49547576904297,
+    2.2363946437835693,
+    38.79622268676758,
+    0.15796485543251038,
+    428099.375
+  ],
+  "std": [
+    1.5086368322372437,
+    0.9704443216323853,
+    0.8538127541542053,
+    46.726722717285156,
+    1.5086368322372437,
+    19.460439682006836,
+    0.33289170265197754,
+    490380.625
+  ],
+  "hidden_channels": 32,
+  "metrics": {
+    "val_accuracy": 0.9959514170040485,
+    "val_f1": 0.9933774834437086,
+    "val_precision": 0.9868421052631579,
+    "val_recall": 1.0,
+    "test_accuracy": 0.9965635738831615,
+    "test_f1": 0.9937888198757764,
+    "trained_on": "synthetic data (ml_training/generate_synthetic_graph_data.py) -- see README"
+  }
+}

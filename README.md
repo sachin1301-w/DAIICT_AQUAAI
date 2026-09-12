@@ -26,7 +26,7 @@ and results stream to the dashboard over a WebSocket. See
 - **Blockchain**: Solidity smart contract (`contracts/RECRegistry.sol`), Hardhat local node, Web3.py integration (`backend/blockchain_service.py`) -- a real chain, not a simulated ledger.
 - **Backend**: FastAPI + SQLAlchemy + SQLite (`backend/`)
 - **ML**: scikit-learn Isolation Forest (+ optional XGBoost), `backend/ml_service.py`
-- **Graph**: NetworkX, `backend/graph_service.py`
+- **Graph**: NetworkX (SCC, Louvain, centrality, motifs) + PyTorch/PyTorch Geometric (trained GraphSAGE GNN), `backend/graph_service.py` + `backend/gnn_service.py`
 - **Verification**: cryptographic tamper detection + on-chain cross-checks, `backend/verification_service.py`
 - **Frontend**: React + Vite + Tailwind CSS + Recharts + vis-network (`frontend/`)
 
@@ -352,6 +352,216 @@ performed, filterable by REC id, company, result and blockchain status --
 the same append-only table the Dashboard's Verification Summary card
 summarizes.
 
+## Graph Fraud Detection
+
+**Graph Fraud Detection** in the sidebar is a separate, deeper page from
+**Network Graph** (which just shows the live transfer graph with a basic
+hub/cycle highlight). This one analyzes the same REC transfer data with a
+full graph-fraud pipeline and persists the results, rather than just
+computing display-friendly stats on the fly:
+
+```
+rec_transactions (SQLite)
+        |
+graph_service.GraphFraudEngine.build()      -- nodes = entities, edges = TRANSFER events
+        |
+Tarjan SCC  +  Louvain communities  +  PageRank/betweenness/degree  +  temporal bursts  +  5 motifs
+        |
+combined_entity_risk()  -- one weighted, explainable 0-100 score per entity
+        |
+graph_entities / graph_edges / fraud_clusters / graph_alerts (persisted)
+        |
+/api/graph/* endpoints  +  `graph_update` WebSocket broadcast  ->  the dashboard page
+```
+
+**Algorithms used, and why:**
+
+- **Circular trading (Tarjan SCC)** -- `graph_service.strongly_connected_components()`
+  uses NetworkX's `strongly_connected_components` (a Tarjan implementation)
+  on the directed graph, not just the simpler `simple_cycles` the existing
+  Fraud Clusters page already used. An SCC catches a closed loop a REC
+  *could* flow through even when no single elementary cycle visits every
+  member -- a strictly stronger circular-trading signal.
+- **Suspicious communities (Louvain)** -- `communities_louvain()` uses
+  NetworkX's native `louvain_communities`. The spec's preferred
+  algorithm, Leiden, is also present in NetworkX 3.6+ but only as a
+  dispatch stub that requires an external backend package that isn't
+  installed in this project (confirmed directly: calling it raises
+  `NotImplementedError`) -- so this build uses Louvain, exactly the
+  fallback the spec itself allows. Each community gets one of four labels
+  (`NORMAL` / `WATCHLIST` / `SUSPICIOUS` / `HIGH_RISK_FRAUD_CLUSTER`) from a
+  simple point system over density, prior alerts, cycles, and hubs -- see
+  `GraphFraudEngine._classify_community`.
+- **Centrality** -- degree/in-degree/out-degree, betweenness, and PageRank
+  are computed per entity and stored on `graph_entities`; a high-degree,
+  high-betweenness node is treated as a suspicious intermediary, never as
+  confirmed fraud on its own.
+- **Temporal bursts** -- `temporal_bursts()` flags either the *same REC*
+  or the *same entity* moving through more than
+  `TEMPORAL_MAX_TRANSFERS_IN_WINDOW` transfers inside
+  `TEMPORAL_RAPID_WINDOW_SECONDS` (both in `config.py`, not hardcoded).
+- **5 named motifs** (`motifs()`): circular trading, duplicate transfer (a
+  generation record reused across more than one issued REC), rapid relay,
+  suspicious hub (high in- *and* out-degree together -- a real
+  pass-through shape, not just a popular receiver), and generator-to-claim
+  mismatch (REC quantity exceeding eligible generation, reusing
+  `rules_engine`'s own over-issuance tolerance so the two never drift
+  apart).
+
+**Combined graph risk score** (`combined_entity_risk`) sums the weighted
+factors from `config.GRAPH_RISK_WEIGHTS` (circular trading, duplicate
+transfer, centrality, community membership, temporal velocity, motif
+match, prior alerts, confirmed REC tampering), capped at 100, with every
+contribution returned as a plain-language reason -- never just a number.
+This runs alongside, not instead of, the existing ML/rule/graph scoring in
+`fraud_decision.py`; nothing about the original per-transaction pipeline
+was replaced.
+
+**Using the page:** search or filter by entity type, risk level, edge
+status, suspicious-only, or a date range; click any node or edge for a full
+investigation panel (connected edges, detected cycles, related REC ids,
+graph alerts); click a fraud ring or community card in the side panel to
+inspect it the same way. From there: **Open REC Verification Portal**
+jumps straight to Verify REC with that REC pre-filled and auto-verified;
+**Mark Under Investigation / Resolved / False Positive** updates the
+underlying cluster/alert status (and is remembered -- the next
+recalculation won't silently flip it back to ACTIVE); **Export (JSON +
+CSV)** downloads everything connected to the current selection.
+
+**Reset Graph** (on this page) vs. **Reset Transactions** (Dashboard /
+Simulation Control): Reset Graph clears only `graph_entities`,
+`graph_edges`, `fraud_clusters` and `graph_alerts` and starts a fresh graph
+`run_id`, without touching the underlying transactions -- use it to rebuild
+the graph cleanly (e.g. after changing a threshold in `config.py`) without
+losing simulated history. Reset Transactions already includes this as part
+of its broader scope (it also clears the transactions themselves). Either
+one broadcasts a `graph_reset` WebSocket event so every open dashboard
+clears its graph view immediately.
+
+**WebSocket events**: `graph_update` fires once per simulator tick with
+live counts; `fraud_ring_detected` / `community_detected` / `motif_detected`
+fire only for a *genuinely new* finding (graph alerts are deduped by an
+exact-match key, not recreated every tick a pattern merely continues to
+hold); `graph_reset` fires on either reset button above. Per-node/per-edge
+`graph_node_added` / `graph_edge_added` / `graph_risk_updated` events are
+not emitted individually -- `analyze()` recomputes the whole graph each
+tick rather than tracking incremental diffs, and the aggregate
+`graph_update` event already covers what the dashboard needs to refresh
+live; this is a deliberate scope decision, not an oversight.
+
+**API endpoints**: `GET /api/graph/{overview,nodes,edges,network,clusters,
+fraud-rings,temporal-analysis,centrality,motifs,export}`,
+`GET /api/graph/{node,edge}/{id}`, `POST /api/graph/{recalculate,reset}`,
+`POST /api/graph/{alerts,clusters}/{id}/status`. GET endpoints read the
+already-persisted tables (kept current by the simulator calling
+`analyze()` once per tick) rather than recomputing SCC/Louvain/PageRank on
+every request -- `POST /api/graph/recalculate` is the explicit on-demand
+trigger for a fresh computation right now.
+
+**Concurrency note**: `GraphFraudEngine` is a singleton read and mutated
+from both the simulator's background thread and FastAPI request threads.
+`build()`/`analyze()` are serialized under a lock, and `build()` populates
+a local graph object before swapping it into `self.graph` atomically --
+found and fixed directly during testing (two concurrent `build()` calls
+could otherwise interleave and double-insert the same transaction as a
+duplicate parallel edge).
+
+**Tests**: `backend/tests/test_graph_fraud.py` (pytest) covers every
+scenario from the spec's test list directly against `graph_service.py` and
+`verification_service.py` -- empty graph, basic transfers, duplicate
+transfer, circular trading, suspicious hub, dense community, rapid
+transfers, combined motifs, generator/claim mismatch, ML+graph
+integration, blockchain status on edges, the 100->150 MWh tampering demo,
+Reset Graph, Reset Transactions clearing graph tables, a fresh run
+containing no old data, REC-id-to-verification-portal linkage, and export.
+Run with:
+
+```bash
+cd backend
+pip install -r requirements.txt   # includes pytest
+pytest tests/ -v
+```
+
+## GNN-Based Entity Risk Scoring
+
+On top of the classical graph algorithms above, `backend/gnn_service.py`
+loads a real, trained **Graph Neural Network** -- a 2-layer GraphSAGE
+(PyTorch + PyTorch Geometric) -- that predicts a per-entity fraud
+probability by message-passing over the live transaction graph itself,
+not just hand-coded rules over graph statistics. This is one more
+independent signal folded into `combined_entity_risk`, alongside (never
+replacing) the SCC/Louvain/centrality/motif detectors and the separate
+tabular Isolation Forest in `ml_service.py`.
+
+**Why GraphSAGE specifically**: it's *inductive* -- it aggregates each
+node's live neighborhood at inference time rather than requiring the
+exact graph it was trained on, which is exactly the situation here (the
+real transaction graph keeps growing as the simulator runs). A
+transductive model (plain GCN on one fixed graph) would need retraining
+every time the graph changed shape.
+
+**Features** (`GraphFraudEngine.gnn_node_features`, `GNN_FEATURE_ORDER`) --
+deliberately raw/structural, not already-derived fraud signals like "is in
+a cycle" (that would just make the GNN parrot the classical detector
+instead of learning anything new via message passing): degree, in-degree,
+out-degree, total REC volume, transaction count, average transfer quantity,
+clustering coefficient, and average time gap between an entity's
+transactions (the model's own way of learning "rapid transfers look
+suspicious", rather than being told so directly). **This exact method is
+called by both training and inference** -- `ml_training/train_gnn.py`
+builds its synthetic training graphs through the same
+`GraphFraudEngine.gnn_node_features()` that `gnn_service.py` calls on the
+live graph, so the two can never silently compute features differently
+from each other.
+
+**Training data**: `ml_training/generate_synthetic_graph_data.py`
+generates ~220 independent small graphs -- normal ownership chains (no
+cycles, hours apart, matching a legitimate REC's lifecycle) plus, in
+~45% of samples, one injected fraud ring (3-6 entities, closed transfer
+loop, dense cross-links, seconds-to-minutes apart -- the same shape
+`backend/simulator.py`'s own `FRAUD_RING` scenario produces, generalized
+across randomized size/membership for topology diversity). **Same
+disclosure as the project's other ML models**: there is no public REC
+fraud dataset, so this is a structural simulation designed to teach clear
+circular/dense/rapid trading *shapes*, not a claim of real-world
+transaction data or guaranteed real-world generalization.
+
+**Retraining**:
+
+```bash
+cd ml_training
+pip install -r requirements.txt   # torch + torch_geometric, CPU builds
+python train_gnn.py
+# copy the two output files to activate/update GNN scoring:
+cp gnn_fraud_model.pt gnn_feature_meta.json ../backend/models/
+```
+
+The script prints validation/test accuracy, precision, recall and F1 as it
+trains, and saves them into `gnn_feature_meta.json` -- the same numbers
+`GET /api/graph/gnn-status` and the Graph Fraud Detection page's status
+banner report, so the frontend is always showing this build's actual
+measured performance, not a hardcoded claim. This project's own shipped
+model scored **test F1 0.994, accuracy 99.7%, recall 1.0** on its held-out
+synthetic split.
+
+**Fail-soft, like every other optional ML component in this project**:
+if `backend/models/gnn_fraud_model.pt` doesn't exist, or torch/
+torch_geometric aren't installed, `gnn_service.available` is simply
+`False` -- `score_entities()` returns `{}` instead of raising, every
+entity's `gnn_risk_score` shows `null`/"n/a (model not loaded)" in the UI,
+and everything else (SCC, Louvain, centrality, motifs, the whole rest of
+the app) keeps working exactly as before. GNN scoring is additive, never a
+hard dependency.
+
+**Where to see it**: the Graph Fraud Detection page shows a status banner
+(model active + its validation F1/accuracy, or why it's unavailable) right
+under the summary cards; a flagged entity's investigation panel shows
+"GNN Score" and, when the GNN contributed to that entity's risk, a
+"GNN model flagged this entity as structurally anomalous (probability
+NN%)" reason alongside the others; node tooltips on the graph itself show
+it too. `GET /api/graph/gnn-status` exposes the same status/metrics over
+the API.
+
 ## What's real vs. simulated
 
 - **Blockchain**: real. `contracts/RECRegistry.sol` is a genuine Solidity
@@ -385,6 +595,13 @@ summarizes.
   The only synthetic part is the optional tamper *scenario itself* (an
   ordinary demo/test tool for producing something to catch), never the
   detection logic that catches it.
+- **GNN**: real, trained model -- genuine backpropagation over 220
+  synthetic graphs (`ml_training/train_gnn.py`), a real saved
+  `state_dict()`, and real forward-pass inference on the live graph at
+  request time (`gnn_service.py`), not a placeholder or a rule dressed up
+  as a neural network. What's synthetic is only the *training data*, for
+  the same reason as the project's other ML models -- see the "GNN-Based
+  Entity Risk Scoring" section above for the full disclosure.
 
 ## Known limitations
 
@@ -412,12 +629,24 @@ summarizes.
 - `POST /api/rec/{rec_id}/verify` has no rate limiting in this build (spec
   section 16 flags it as recommended) -- fine for a hackathon demo, not for
   a publicly reachable deployment.
+- The shipped GNN's near-perfect validation metrics (F1 0.994) reflect that
+  the synthetic fraud rings have a genuinely distinctive structural
+  signature (short time gaps, tight clustering) that's easy for a GNN to
+  separate from sparse legitimate chains -- expect a real-world dataset
+  with subtler fraud patterns to be a harder classification problem than
+  this one.
+- This environment runs Python 3.14, newer than PyTorch officially targets
+  yet -- `pytest tests/` prints `DeprecationWarning`s from `torch.jit` and
+  `torch_geometric`'s internals about future Python versions. These are
+  warnings only (every test still passes, training and inference both work
+  correctly); they'll go away once upstream catches up to 3.14.
 
 ## Project layout
 
 ```
-backend/        FastAPI app, SQLAlchemy models, pipeline, ML/graph/blockchain/verification services
+backend/        FastAPI app, SQLAlchemy models, pipeline, ML/graph/GNN/blockchain/verification services
+backend/tests/  pytest suite for the graph fraud detection module (incl. GNN)
 contracts/      Solidity contract + Hardhat project (compile/deploy/test)
-ml_training/    Standalone scripts to train a better tx-level model (Colab-friendly)
+ml_training/    Standalone scripts to train the tx-level model + the GNN (Colab-friendly)
 frontend/       React + Vite dashboard
 ```

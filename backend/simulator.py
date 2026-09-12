@@ -35,6 +35,7 @@ def _new_run_id() -> str:
 # are deliberately NOT touched -- see Simulator.reset_all's docstring.
 _RESET_TABLES = [
     models.FraudAlert,
+    models.GraphAlert,
     models.RECTransaction,
     models.GraphEdge,
     models.FraudCluster,
@@ -359,12 +360,11 @@ class Simulator:
                     result.setdefault("tamper_simulation", tamper_result)
 
             graph_engine = graph_service.get_engine()
-            graph_engine.build(db)
-            graph_engine.sync_clusters_to_db(db)
-            graph_engine.sync_entities_to_db(db)
+            graph_summary = graph_engine.analyze(db)
 
             websocket_service.broadcast_sync({"type": "pipeline_result", "data": result})
             _broadcast_transaction_created(result)
+            _broadcast_graph_update(graph_summary)
             return result
         finally:
             db.close()
@@ -435,6 +435,50 @@ def _broadcast_transaction_created(result: dict) -> None:
         "blockchain_tx_hash": rec.get("blockchain_tx_hash") or tx.get("blockchain_tx_hash"),
         "fraud_type": result.get("injected_scenario") if result.get("is_fraud_injected") else None,
     })
+
+
+_ALERT_KEY_EVENT = {
+    "scc": "fraud_ring_detected",
+    "community": "community_detected",
+    "hub": "motif_detected",
+    "dup": "motif_detected",
+    "mismatch": "motif_detected",
+    "temporal": "motif_detected",
+}
+
+
+def _broadcast_graph_update(summary: dict) -> None:
+    """Pushes the aggregate `graph_update` event every tick (spec section
+    13), plus one specific event per genuinely NEW graph_alerts row this
+    analyze() call created (fraud_ring_detected / community_detected /
+    motif_detected) -- not every tick a pattern merely *remains* true,
+    since `_sync_graph_alerts` dedupes by key and only reports freshly
+    created ones. Granular graph_node_added/graph_edge_added/
+    graph_risk_updated events are intentionally not emitted per-node/edge --
+    analyze() recomputes the whole graph rather than tracking incremental
+    diffs, and the aggregate graph_update already covers what the dashboard
+    needs to refresh live."""
+    websocket_service.broadcast_sync({
+        "type": "graph_update",
+        "run_id": summary["run_id"],
+        "node_count": summary["node_count"],
+        "edge_count": summary["edge_count"],
+        "suspicious_nodes": summary["suspicious_nodes"],
+        "suspicious_edges": summary["suspicious_edges"],
+        "fraud_rings": summary["fraud_rings"],
+        "suspicious_communities": summary["suspicious_communities"],
+    })
+
+    seen_events = set()
+    for key in summary.get("new_alert_keys", []):
+        prefix = key.split(":", 1)[0]
+        event = _ALERT_KEY_EVENT.get(prefix)
+        if not event or event in seen_events:
+            continue
+        seen_events.add(event)
+        websocket_service.broadcast_sync({
+            "type": event, "run_id": summary["run_id"], "key": key,
+        })
 
 
 _simulator = Simulator()

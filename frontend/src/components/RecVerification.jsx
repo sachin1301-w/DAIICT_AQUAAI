@@ -54,8 +54,8 @@ function openPrintableReport(report) {
   w.document.close();
 }
 
-export default function RecVerification({ resetEpoch = 0 }) {
-  const [recId, setRecId] = useState("");
+export default function RecVerification({ resetEpoch = 0, initialRecId = "" }) {
+  const [recId, setRecId] = useState(initialRecId);
   const [company, setCompany] = useState("");
   const [verifierUser, setVerifierUser] = useState("");
   const [result, setResult] = useState(null);
@@ -72,9 +72,19 @@ export default function RecVerification({ resetEpoch = 0 }) {
     }
   }, [resetEpoch]);
 
-  async function runVerify(e) {
+  // Deep-linked from the Graph Fraud Detection page (click a REC ID there)
+  // -- re-runs whenever a new initialRecId arrives, not just on first mount.
+  useEffect(() => {
+    if (initialRecId) {
+      setRecId(initialRecId);
+      runVerify(null, initialRecId);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialRecId]);
+
+  async function runVerify(e, overrideRecId) {
     e?.preventDefault();
-    const target = recId.trim();
+    const target = (overrideRecId ?? recId).trim();
     if (!target) return;
     setBusy(true);
     setError(null);

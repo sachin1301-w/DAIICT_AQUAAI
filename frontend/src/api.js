@@ -66,7 +66,37 @@ export const api = {
 
   submitGeneration: (payload) => request("/api/generation", { method: "POST", body: JSON.stringify(payload) }),
   submitTransfer: (payload) => request("/api/transactions/transfer", { method: "POST", body: JSON.stringify(payload) }),
+
+  // Advanced Graph Fraud Detection
+  graphOverview: () => request("/api/graph/overview"),
+  graphNodes: (params) => request(`/api/graph/nodes${qs(params)}`),
+  graphEdges: (params) => request(`/api/graph/edges${qs(params)}`),
+  graphNetwork: (params) => request(`/api/graph/network${qs(params)}`),
+  graphNode: (entityId) => request(`/api/graph/node/${encodeURIComponent(entityId)}`),
+  graphEdge: (transactionId) => request(`/api/graph/edge/${encodeURIComponent(transactionId)}`),
+  graphClusters: (params) => request(`/api/graph/clusters${qs(params)}`),
+  graphFraudRings: () => request("/api/graph/fraud-rings"),
+  graphTemporalAnalysis: () => request("/api/graph/temporal-analysis"),
+  graphCentrality: () => request("/api/graph/centrality"),
+  graphMotifs: () => request("/api/graph/motifs"),
+  graphGnnStatus: () => request("/api/graph/gnn-status"),
+  graphRecalculate: () => request("/api/graph/recalculate", { method: "POST" }),
+  graphReset: () => request("/api/graph/reset", { method: "POST" }),
+  graphExport: (params) => request(`/api/graph/export${qs(params)}`),
+  graphAlertStatus: (alertId, status) =>
+    request(`/api/graph/alerts/${alertId}/status`, { method: "POST", body: JSON.stringify({ status }) }),
+  graphClusterStatus: (clusterId, status) =>
+    request(`/api/graph/clusters/${clusterId}/status`, { method: "POST", body: JSON.stringify({ status }) }),
 };
+
+function qs(params) {
+  if (!params) return "";
+  const q = new URLSearchParams(
+    Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== "")
+  );
+  const s = q.toString();
+  return s ? `?${s}` : "";
+}
 
 export function connectLiveFeed(onMessage) {
   const wsBase = BASE.replace(/^http/, "ws");

@@ -16,10 +16,13 @@ frontend/dist/
 contracts/cache/
 contracts/artifacts/
 
-# ml_training generated outputs
+# ml_training generated outputs (backend/models/ has the shipped copies
+# the app actually loads -- these ml_training/-level ones are just the
+# training script's raw output directory, regenerable via train_*.py)
 ml_training/*.pkl
 ml_training/*.json
 ml_training/*.csv
+ml_training/*.pt
 
 # env
 .env

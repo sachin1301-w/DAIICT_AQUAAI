@@ -10,3 +10,13 @@ numpy>=1.26
 joblib>=1.4
 web3>=7.0
 python-dotenv>=1.0
+
+# GNN-based entity risk scoring (backend/gnn_service.py) -- CPU builds,
+# no CUDA needed. Optional at runtime: gnn_service degrades to "unavailable"
+# gracefully if these aren't installed or backend/models/gnn_fraud_model.pt
+# doesn't exist yet (run ml_training/train_gnn.py to produce it).
+torch>=2.5
+torch_geometric>=2.5
+
+# dev / tests
+pytest>=8.0

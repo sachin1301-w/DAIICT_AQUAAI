@@ -108,24 +108,47 @@ class GraphEntity(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     entity_id = Column(String(64), unique=True, index=True)
-    entity_type = Column(String(20), nullable=False)  # GENERATOR | BROKER | TRADER | COMPANY
+    entity_type = Column(String(20), nullable=False)  # GENERATOR | ISSUER | BUYER | BROKER | TRADER | COMPANY | ACCOUNT
     entity_name = Column(String(120), nullable=True)
     risk_score = Column(Float, default=0)
+    risk_level = Column(String(20), default="LOW")  # LOW | WATCHLIST | HIGH | CRITICAL
     degree = Column(Integer, default=0)
+    in_degree = Column(Integer, default=0)
+    out_degree = Column(Integer, default=0)
     betweenness = Column(Float, default=0)
+    pagerank_score = Column(Float, default=0)
+    # Fraud probability (0-1) from the trained GraphSAGE model, or None
+    # when gnn_service.available is False (model not trained/loaded) --
+    # distinct from `risk_score`, which already folds this in as one of
+    # several weighted signals (see GraphFraudEngine.combined_entity_risk).
+    gnn_risk_score = Column(Float, nullable=True)
+    community_id = Column(String(40), nullable=True)
+    total_rec_volume = Column(Float, default=0)
+    transaction_count = Column(Integer, default=0)
+    alert_count = Column(Integer, default=0)
+    run_id = Column(String(40), nullable=True, index=True)
     created_at = Column(Float, default=time.time)
+    updated_at = Column(Float, default=time.time)
 
 
 class GraphEdge(Base):
     __tablename__ = "graph_edges"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    transaction_id = Column(String(40), nullable=True, index=True)
     source_entity = Column(String(64), index=True)
     target_entity = Column(String(64), index=True)
     relationship_type = Column(String(20), nullable=False)  # ISSUED | OWNED | TRANSFERRED | RETIRED
     rec_id = Column(String(40), nullable=True)
     quantity = Column(Float, default=0)
+    risk_score = Column(Float, default=0)
+    risk_level = Column(String(20), default="LOW")
+    status = Column(String(20), default="ACTIVE")
+    fraud_reason = Column(Text, default="[]")  # JSON-encoded list[str]
+    blockchain_status = Column(String(20), nullable=True)
+    blockchain_tx_hash = Column(String(80), nullable=True)
     transaction_timestamp = Column(Float, default=time.time)
+    run_id = Column(String(40), nullable=True, index=True)
 
 
 class FraudCluster(Base):
@@ -133,14 +156,46 @@ class FraudCluster(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     cluster_id = Column(String(40), unique=True, index=True, default=lambda: _uuid("FRAUD"))
+    cluster_type = Column(String(30), default="COMMUNITY")  # COMMUNITY | SCC | MOTIF
     entity_count = Column(Integer, default=0)
     rec_count = Column(Integer, default=0)
     transfer_count = Column(Integer, default=0)
     graph_score = Column(Float, default=0)
     risk_score = Column(Float, default=0)
+    risk_level = Column(String(20), default="LOW")
     fraud_pattern = Column(Text, default="[]")  # JSON-encoded list[str]
+    detection_reason = Column(Text, nullable=True)
     status = Column(String(20), default="ACTIVE")
+    run_id = Column(String(40), nullable=True, index=True)
     created_at = Column(Float, default=time.time)
+
+
+class GraphAlert(Base):
+    """Structure-level alerts (a cycle, a community, a motif, a hub) --
+    distinct from FraudAlert, which is one transaction's rule/ML/graph
+    decision. A single SCC or community can span many transactions, so it
+    gets its own alert row rather than being force-fit onto one of them."""
+    __tablename__ = "graph_alerts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    alert_id = Column(String(40), unique=True, index=True, default=lambda: _uuid("GALERT"))
+    alert_type = Column(String(30), nullable=False)  # CYCLE | COMMUNITY | HUB | MOTIF | TEMPORAL
+    # Exact-match dedup key (see verification_service... no, graph_service._sync_graph_alerts):
+    # a plain string, never JSON-nested inside itself, so an exact `==`
+    # lookup is reliable -- a substring/LIKE match against the JSON
+    # `evidence` blob broke whenever a key itself contained embedded quotes
+    # (e.g. temporal alert keys), silently defeating dedup and spamming a
+    # fresh alert every tick.
+    dedup_key = Column(String(300), nullable=True, index=True)
+    entity_id = Column(String(64), nullable=True, index=True)
+    transaction_id = Column(String(40), nullable=True)
+    cluster_id = Column(String(40), nullable=True, index=True)
+    severity = Column(String(20), default="LOW")  # LOW | MEDIUM | HIGH | CRITICAL
+    reason = Column(Text, nullable=True)
+    evidence = Column(Text, default="{}")  # JSON blob: entities/recs/txs/timestamps involved
+    status = Column(String(20), default="OPEN")  # OPEN | UNDER_INVESTIGATION | RESOLVED | FALSE_POSITIVE
+    created_at = Column(Float, default=time.time)
+    run_id = Column(String(40), nullable=True, index=True)
 
 
 class RECVerificationRequest(Base):

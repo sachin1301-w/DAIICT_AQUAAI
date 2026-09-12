@@ -266,10 +266,13 @@ def process_generation_event(db: Session, generator_id: str, energy_generated_mw
             transaction_type="ISSUE", quantity=rec_quantity, transaction_timestamp=now,
         )
         db.add(tx_row)
-        db.add(models.GraphEdge(
-            source_entity="ISSUANCE", target_entity=rec.current_owner, relationship_type="ISSUED",
-            rec_id=rec.rec_id, quantity=rec_quantity, transaction_timestamp=now,
-        ))
+        # No GraphEdge insert here -- graph_service.build() deliberately
+        # does not turn ISSUE events into edges from a shared "ISSUANCE"
+        # node (see its module docstring: that would merge every unrelated
+        # plant into one false hub/cluster). graph_service.analyze()
+        # persists graph_edges from the analytical graph itself, keyed by
+        # transaction_id, once per simulator tick -- inserting a row here
+        # too used to create a stale, never-synced duplicate.
         chain_result = chain.issue_rec(rec.rec_id, generator_id, rec_quantity, _resolve_address(rec.current_owner), canonical_hash)
         status, message = _blockchain_settlement(chain, chain_result, rec_id=rec.rec_id, expected_hash=canonical_hash)
         for row in (rec, tx_row):
@@ -371,10 +374,12 @@ def process_transfer(db: Session, rec_id: str, sender: str, receiver: str, quant
     if decision["decision"] == "LEGITIMATE":
         rec.current_owner = receiver
         db.add(transaction)
-        db.add(models.GraphEdge(
-            source_entity=sender, target_entity=receiver, relationship_type="TRANSFERRED",
-            rec_id=rec_id, quantity=quantity, transaction_timestamp=now,
-        ))
+        # No GraphEdge insert here either -- see the matching comment in
+        # process_generation_event. graph_service.analyze() (run once per
+        # simulator tick) is the single source of truth for graph_edges now,
+        # upserted by transaction_id with proper risk scoring attached; a
+        # second, incomplete insert here (no transaction_id, no risk fields)
+        # used to create a silent duplicate row for every transfer.
         chain_result = chain.transfer_rec(rec_id, _label_for(sender), _resolve_address(receiver))
         status, message = _blockchain_settlement(chain, chain_result)
         transaction.blockchain_tx_hash = chain_result.tx_hash

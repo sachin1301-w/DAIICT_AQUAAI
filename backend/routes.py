@@ -7,6 +7,8 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+import config
+import gnn_service
 import models
 import pipeline
 import schemas
@@ -232,6 +234,272 @@ def network_graph(db: Session = Depends(get_db)):
     return engine.as_visjs()
 
 
+# ---------------------------------------------------------------- Advanced Graph Fraud Detection
+#
+# GET endpoints read the graph_entities/graph_edges/fraud_clusters/
+# graph_alerts tables -- already kept current by the simulator calling
+# `engine.analyze(db)` once per tick -- rather than recomputing SCC/Louvain/
+# PageRank/motifs on every request (spec section 19: avoid recalculating the
+# whole graph for every minor UI action). POST /graph/recalculate is the
+# explicit on-demand trigger when you want a fresh computation right now.
+
+def _graph_entity_dict(r: models.GraphEntity) -> dict:
+    return {
+        "entity_id": r.entity_id, "entity_type": r.entity_type, "entity_name": r.entity_name,
+        "risk_score": r.risk_score, "risk_level": r.risk_level,
+        "degree": r.degree, "in_degree": r.in_degree, "out_degree": r.out_degree,
+        "betweenness_centrality": r.betweenness, "pagerank_score": r.pagerank_score,
+        "gnn_risk_score": r.gnn_risk_score,
+        "community_id": r.community_id, "total_rec_volume": r.total_rec_volume,
+        "transaction_count": r.transaction_count, "alert_count": r.alert_count,
+        "run_id": r.run_id, "created_at": r.created_at, "updated_at": r.updated_at,
+    }
+
+
+def _graph_edge_dict(r: models.GraphEdge) -> dict:
+    return {
+        "transaction_id": r.transaction_id, "source_entity": r.source_entity, "target_entity": r.target_entity,
+        "relationship_type": r.relationship_type, "rec_id": r.rec_id, "quantity": r.quantity,
+        "risk_score": r.risk_score, "risk_level": r.risk_level, "status": r.status,
+        "fraud_reason": json.loads(r.fraud_reason or "[]"),
+        "blockchain_status": r.blockchain_status, "blockchain_tx_hash": r.blockchain_tx_hash,
+        "transaction_timestamp": r.transaction_timestamp, "run_id": r.run_id,
+    }
+
+
+def _cluster_dict(r: models.FraudCluster) -> dict:
+    return {
+        "cluster_id": r.cluster_id, "cluster_type": r.cluster_type, "member_count": r.entity_count,
+        "rec_count": r.rec_count, "transfer_count": r.transfer_count, "graph_score": r.graph_score,
+        "risk_score": r.risk_score, "risk_level": r.risk_level,
+        "fraud_pattern": json.loads(r.fraud_pattern or "[]"), "detection_reason": r.detection_reason,
+        "status": r.status, "run_id": r.run_id, "created_at": r.created_at,
+    }
+
+
+def _graph_alert_dict(r: models.GraphAlert) -> dict:
+    return {
+        "alert_id": r.alert_id, "alert_type": r.alert_type, "entity_id": r.entity_id,
+        "transaction_id": r.transaction_id, "cluster_id": r.cluster_id, "severity": r.severity,
+        "reason": r.reason, "evidence": json.loads(r.evidence or "{}"), "status": r.status,
+        "created_at": r.created_at, "run_id": r.run_id,
+    }
+
+
+@router.get("/graph/overview")
+def graph_overview(db: Session = Depends(get_db)):
+    engine = get_graph_engine()
+    return {
+        "run_id": engine.run_id,
+        "total_nodes": db.query(models.GraphEntity).count(),
+        "total_edges": db.query(models.GraphEdge).count(),
+        "suspicious_nodes": db.query(models.GraphEntity).filter(models.GraphEntity.risk_level.in_(["HIGH", "CRITICAL"])).count(),
+        "suspicious_edges": db.query(models.GraphEdge).filter(models.GraphEdge.risk_level.in_(["HIGH", "CRITICAL"])).count(),
+        "fraud_rings": db.query(models.FraudCluster).filter_by(cluster_type="SCC", status="ACTIVE").count(),
+        "suspicious_communities": db.query(models.FraudCluster).filter(
+            models.FraudCluster.cluster_type == "COMMUNITY", models.FraudCluster.status == "ACTIVE",
+            models.FraudCluster.risk_level.in_(["SUSPICIOUS", "HIGH_RISK_FRAUD_CLUSTER"]),
+        ).count(),
+        "high_risk_brokers": db.query(models.GraphEntity).filter(
+            models.GraphEntity.degree >= config.GRAPH_HIGH_DEGREE_THRESHOLD
+        ).count(),
+        "active_graph_alerts": db.query(models.GraphAlert).filter_by(status="OPEN").count(),
+        "generated_at": time.time(),
+    }
+
+
+@router.get("/graph/nodes")
+def graph_nodes(node_type: str | None = None, risk_level: str | None = None, search: str | None = None,
+                 limit: int = 200, offset: int = 0, db: Session = Depends(get_db)):
+    q = db.query(models.GraphEntity)
+    if node_type:
+        q = q.filter_by(entity_type=node_type.upper())
+    if risk_level:
+        q = q.filter_by(risk_level=risk_level.upper())
+    if search:
+        q = q.filter(models.GraphEntity.entity_id.ilike(f"%{search}%"))
+    total = q.count()
+    rows = q.order_by(models.GraphEntity.risk_score.desc()).offset(offset).limit(min(limit, 500)).all()
+    return {"total": total, "nodes": [_graph_entity_dict(r) for r in rows]}
+
+
+@router.get("/graph/edges")
+def graph_edges_route(status: str | None = None, risk_level: str | None = None, since: float | None = None,
+                       until: float | None = None, limit: int = 200, offset: int = 0, db: Session = Depends(get_db)):
+    q = db.query(models.GraphEdge)
+    if status:
+        q = q.filter_by(status=status.upper())
+    if risk_level:
+        q = q.filter_by(risk_level=risk_level.upper())
+    if since is not None:
+        q = q.filter(models.GraphEdge.transaction_timestamp >= since)
+    if until is not None:
+        q = q.filter(models.GraphEdge.transaction_timestamp <= until)
+    total = q.count()
+    rows = q.order_by(models.GraphEdge.transaction_timestamp.desc()).offset(offset).limit(min(limit, 500)).all()
+    return {"total": total, "edges": [_graph_edge_dict(r) for r in rows]}
+
+
+@router.get("/graph/network")
+def graph_network(node_type: str | None = None, risk_level: str | None = None, status: str | None = None,
+                   since: float | None = None, until: float | None = None, suspicious_only: bool = False,
+                   search: str | None = None, db: Session = Depends(get_db)):
+    engine = get_graph_engine()
+    engine.build(db)
+    return engine.to_network_json(db, node_type=node_type, risk_level=risk_level, status=status,
+                                   since=since, until=until, suspicious_only=suspicious_only, search=search)
+
+
+@router.get("/graph/node/{entity_id}")
+def graph_node_detail(entity_id: str, db: Session = Depends(get_db)):
+    row = db.query(models.GraphEntity).filter_by(entity_id=entity_id).first()
+    if not row:
+        raise HTTPException(404, "entity not found in graph")
+    engine = get_graph_engine()
+    engine.build(db)
+    edges = db.query(models.GraphEdge).filter(
+        (models.GraphEdge.source_entity == entity_id) | (models.GraphEdge.target_entity == entity_id)
+    ).order_by(models.GraphEdge.transaction_timestamp.desc()).all()
+    alerts = db.query(models.GraphAlert).filter_by(entity_id=entity_id).order_by(models.GraphAlert.created_at.desc()).all()
+    cycles = [c for c in engine.strongly_connected_components() if entity_id in c]
+    return {
+        **_graph_entity_dict(row),
+        "connected_edges": [_graph_edge_dict(e) for e in edges],
+        "graph_alerts": [_graph_alert_dict(a) for a in alerts],
+        "cycles": cycles,
+        "related_rec_ids": sorted({e.rec_id for e in edges if e.rec_id}),
+    }
+
+
+@router.get("/graph/edge/{transaction_id}")
+def graph_edge_detail(transaction_id: str, db: Session = Depends(get_db)):
+    row = db.query(models.GraphEdge).filter_by(transaction_id=transaction_id).first()
+    if not row:
+        raise HTTPException(404, "edge not found in graph")
+    return _graph_edge_dict(row)
+
+
+@router.get("/graph/clusters")
+def graph_clusters_route(cluster_type: str | None = None, risk_level: str | None = None, db: Session = Depends(get_db)):
+    q = db.query(models.FraudCluster).filter_by(status="ACTIVE")
+    if cluster_type:
+        q = q.filter_by(cluster_type=cluster_type.upper())
+    if risk_level:
+        q = q.filter_by(risk_level=risk_level.upper())
+    rows = q.order_by(models.FraudCluster.risk_score.desc()).all()
+    return [_cluster_dict(r) for r in rows]
+
+
+@router.get("/graph/fraud-rings")
+def graph_fraud_rings(db: Session = Depends(get_db)):
+    rows = db.query(models.FraudCluster).filter_by(cluster_type="SCC", status="ACTIVE") \
+        .order_by(models.FraudCluster.risk_score.desc()).all()
+    return [_cluster_dict(r) for r in rows]
+
+
+@router.get("/graph/temporal-analysis")
+def graph_temporal_analysis(db: Session = Depends(get_db)):
+    engine = get_graph_engine()
+    engine.build(db)
+    return {
+        "run_id": engine.run_id, "window_seconds": config.TEMPORAL_RAPID_WINDOW_SECONDS,
+        "max_transfers_threshold": config.TEMPORAL_MAX_TRANSFERS_IN_WINDOW,
+        "bursts": engine.temporal_bursts(),
+    }
+
+
+@router.get("/graph/centrality")
+def graph_centrality(db: Session = Depends(get_db)):
+    rows = db.query(models.GraphEntity).order_by(models.GraphEntity.betweenness.desc()).all()
+    return [
+        {
+            "entity_id": r.entity_id, "degree": r.degree, "in_degree": r.in_degree, "out_degree": r.out_degree,
+            "betweenness_centrality": r.betweenness, "pagerank_score": r.pagerank_score, "risk_score": r.risk_score,
+        }
+        for r in rows
+    ]
+
+
+@router.get("/graph/motifs")
+def graph_motifs(db: Session = Depends(get_db)):
+    engine = get_graph_engine()
+    engine.build(db)
+    return engine.motifs(db)
+
+
+@router.get("/graph/gnn-status")
+def graph_gnn_status():
+    """Whether the trained GraphSAGE model is loaded, plus its training-time
+    validation metrics -- lets the frontend show honestly whether GNN
+    scores on this page are real or just absent because nobody has run
+    ml_training/train_gnn.py yet."""
+    return gnn_service.get_service().status()
+
+
+@router.post("/graph/recalculate")
+def graph_recalculate(db: Session = Depends(get_db)):
+    engine = get_graph_engine()
+    summary = engine.analyze(db)
+    websocket_service.broadcast_sync({
+        "type": "graph_update", "run_id": summary["run_id"], "node_count": summary["node_count"],
+        "edge_count": summary["edge_count"], "suspicious_nodes": summary["suspicious_nodes"],
+        "suspicious_edges": summary["suspicious_edges"], "fraud_rings": summary["fraud_rings"],
+        "suspicious_communities": summary["suspicious_communities"],
+    })
+    return summary
+
+
+@router.post("/graph/reset")
+def graph_reset_route(db: Session = Depends(get_db)):
+    """Narrower than /api/simulation/reset (spec section 14's "Reset Graph"
+    button): clears only the graph-derived tables (entities/edges/clusters/
+    alerts) and starts a fresh graph run_id, WITHOUT touching transactions,
+    RECs, or fraud_alerts -- lets the graph be rebuilt cleanly from existing
+    transaction history. Reset Transactions (above) already includes this
+    as part of its broader scope."""
+    counts = {}
+    for model in (models.GraphAlert, models.GraphEdge, models.FraudCluster, models.GraphEntity):
+        counts[model.__tablename__] = db.query(model).count()
+        db.query(model).delete(synchronize_session=False)
+    db.commit()
+    engine = get_graph_engine()
+    engine.reset(new_run_id=True)
+    websocket_service.broadcast_sync({
+        "type": "graph_reset", "run_id": engine.run_id,
+        "node_count": 0, "edge_count": 0, "suspicious_nodes": 0, "fraud_rings": 0,
+    })
+    return {"success": True, "message": "Graph data reset successfully", "cleared": counts, "run_id": engine.run_id}
+
+
+@router.get("/graph/export")
+def graph_export(entity_id: str | None = None, cluster_id: str | None = None, db: Session = Depends(get_db)):
+    if not entity_id and not cluster_id:
+        raise HTTPException(400, "pass entity_id or cluster_id")
+    engine = get_graph_engine()
+    engine.build(db)
+    return engine.export_investigation(db, entity_id=entity_id, cluster_id=cluster_id)
+
+
+@router.post("/graph/alerts/{alert_id}/status")
+def update_graph_alert_status(alert_id: str, payload: schemas.GraphStatusUpdate, db: Session = Depends(get_db)):
+    row = db.query(models.GraphAlert).filter_by(alert_id=alert_id).first()
+    if not row:
+        raise HTTPException(404, "graph alert not found")
+    row.status = payload.status
+    db.commit()
+    return _graph_alert_dict(row)
+
+
+@router.post("/graph/clusters/{cluster_id}/status")
+def update_cluster_status(cluster_id: str, payload: schemas.GraphStatusUpdate, db: Session = Depends(get_db)):
+    row = db.query(models.FraudCluster).filter_by(cluster_id=cluster_id).first()
+    if not row:
+        raise HTTPException(404, "cluster not found")
+    row.status = payload.status
+    db.commit()
+    return _cluster_dict(row)
+
+
 # ---------------------------------------------------------------- blockchain
 
 @router.get("/blockchain/status")
@@ -448,6 +716,7 @@ def simulation_reset(db: Session = Depends(get_db)):
     counts = sim.reset_all(db)
     status = sim.status()
 
+    graph_run_id = get_graph_engine().run_id
     payload = {
         "type": "simulation_reset",
         "message": "All simulation transactions cleared",
@@ -456,8 +725,13 @@ def simulation_reset(db: Session = Depends(get_db)):
         "graph_node_count": 0,
         "graph_edge_count": 0,
         "simulation_run_id": status["simulation_run_id"],
+        "graph_run_id": graph_run_id,
     }
     websocket_service.broadcast_sync(payload)
+    websocket_service.broadcast_sync({
+        "type": "graph_reset", "run_id": graph_run_id,
+        "node_count": 0, "edge_count": 0, "suspicious_nodes": 0, "fraud_rings": 0,
+    })
 
     return {
         "success": True,
@@ -479,6 +753,7 @@ def submit_generation(payload: schemas.GenerationSubmit, db: Session = Depends(g
     )
     if "error" in result:
         raise HTTPException(400, result["error"])
+    get_graph_engine().analyze(db)
     return result
 
 
@@ -487,4 +762,5 @@ def submit_transfer(payload: schemas.TransferRequest, db: Session = Depends(get_
     result = pipeline.process_transfer(db, payload.rec_id, payload.sender, payload.receiver, payload.quantity)
     if "error" in result:
         raise HTTPException(400, result["error"])
+    get_graph_engine().analyze(db)
     return result

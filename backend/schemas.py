@@ -59,3 +59,7 @@ class VerifyRecRequest(BaseModel):
 
 class VerificationReportRequest(BaseModel):
     verification_id: str
+
+
+class GraphStatusUpdate(BaseModel):
+    status: str = Field(pattern="^(UNDER_INVESTIGATION|RESOLVED|FALSE_POSITIVE|OPEN|ACTIVE)$")

@@ -3,3 +3,8 @@ numpy>=1.26
 scikit-learn>=1.6
 xgboost>=2.0
 joblib>=1.4
+
+# for train_gnn.py -- also needs networkx, already in backend/requirements.txt
+networkx>=3.4
+torch>=2.5
+torch_geometric>=2.5
