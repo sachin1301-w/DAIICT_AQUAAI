@@ -10,7 +10,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # ---------------- database ----------------
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{BASE_DIR / 'rec_fraud.db'}")
-
+API_PORT = int(os.getenv("API_PORT", os.getenv("PORT", "8000")))
 # ---------------- simulation ----------------
 SIMULATION_INTERVAL_SECONDS = float(os.getenv("SIMULATION_INTERVAL_SECONDS", "5"))
 FRAUD_PROBABILITY = float(os.getenv("FRAUD_PROBABILITY", "0.15"))
